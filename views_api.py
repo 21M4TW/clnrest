@@ -1,245 +1,470 @@
-# Description: This file contains the extensions API endpoints.
 from http import HTTPStatus
+from math import ceil
 
-from fastapi import APIRouter, Depends
-from fastapi.exceptions import HTTPException
-from lnbits.core.models import SimpleStatus, User
-from lnbits.db import Filters, Page
-from lnbits.decorators import (
-    check_user_exists,
-    parse_filters,
+from bolt11 import decode as bolt11_decode
+from fastapi import APIRouter, Depends, HTTPException
+from lnbits.core.crud import get_offers, get_payments, get_standalone_offer
+from lnbits.core.db import db
+from lnbits.core.models import CreateInvoice, Offer, OfferFilters, PaymentFilters, PaymentState, WalletTypeInfo
+from lnbits.core.services import (
+    create_offer,
+    create_payment_request,
+    disable_offer,
+    enable_offer,
+    fetch_invoice,
+    pay_invoice,
 )
-from lnbits.helpers import generate_filter_params_openapi
+from lnbits.db import Filters
+from lnbits.wallets import get_funding_source
+from loguru import logger
 
-from .crud import (
-    create_client_data,
-    create_owner_data,
-    delete_client_data,
-    delete_owner_data,
-    get_client_data_by_id,
-    get_client_data_paginated,
-    get_owner_data,
-    get_owner_data_ids_by_user,
-    get_owner_data_paginated,
-    update_client_data,
-    update_owner_data,
-)
+from .decorators import clnrest_require_admin_key, clnrest_require_invoice_key
 from .models import (
-    ClientData,
-    ClientDataFilters,
-    CreateClientData,
-    CreateOwnerData,
-    OwnerData,
-    OwnerDataFilters,
+    Decode,
+    DecodeData,
+    EnableOfferData,
+    FetchInvoice,
+    FetchInvoiceData,
+    Invoice,
+    InvoiceData,
+    ListOffers,
+    ListOffersData,
+    OfferData,
+    Pay,
+    PayData,
+    QueryStr,
 )
 
-
-owner_data_filters = parse_filters(OwnerDataFilters)
-client_data_filters = parse_filters(ClientDataFilters)
-
-clnrest_api_router = APIRouter()
+clnrest_api_router = APIRouter(prefix="/v1")
 
 
-############################# Owner Data #############################
-@clnrest_api_router.post("/api/v1/owner_data", status_code=HTTPStatus.CREATED)
-async def api_create_owner_data(
-    data: CreateOwnerData,
-    user: User = Depends(check_user_exists),
-) -> OwnerData:
-    owner_data = await create_owner_data(user.id, data)
-    return owner_data
+@clnrest_api_router.post("/decode")
+async def clnrest_decode(
+    decode_data: DecodeData, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)
+) -> Decode:
+    logger.debug("decode data: " + str(decode_data.dict()))
 
+    try:
+        funding_source = get_funding_source()
+        decode = await funding_source.decode_invoice(decode_data.string)
 
-@clnrest_api_router.put("/api/v1/owner_data/{owner_data_id}", status_code=HTTPStatus.CREATED)
-async def api_update_owner_data(
-    owner_data_id: str,
-    data: CreateOwnerData,
-    user: User = Depends(check_user_exists),
-) -> OwnerData:
-    owner_data = await get_owner_data(user.id, owner_data_id)
-    if not owner_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "Owner Data not found.")
-    if owner_data.user_id != user.id:
-        raise HTTPException(HTTPStatus.FORBIDDEN, "You do not own this owner data.")
-    owner_data = await update_owner_data(OwnerData(**{**owner_data.dict(), **data.dict()}))
-    return owner_data
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Invoice decoding failed: " + str(exc),
+        )
 
+    if not decode:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Could not decode payment request: " + decode_data.string,
+        )
 
-@clnrest_api_router.get(
-    "/api/v1/owner_data/paginated",
-    name="Owner Data List",
-    summary="get paginated list of owner_data",
-    response_description="list of owner_data",
-    openapi_extra=generate_filter_params_openapi(OwnerDataFilters),
-    response_model=Page[OwnerData],
-)
-async def api_get_owner_data_paginated(
-    user: User = Depends(check_user_exists),
-    filters: Filters = Depends(owner_data_filters),
-) -> Page[OwnerData]:
-
-    return await get_owner_data_paginated(
-        user_id=user.id,
-        filters=filters,
+    return Decode(
+        bolt11=decode.bolt11,
+        created_at=decode.invoice_created_at,
+        payee=decode.invoice_node_id,
+        payment_secret=decode.payment_secret,
+        expiry=decode.invoice_relative_expiry,
+        payment_hash=decode.payment_hash,
+        amount_msat=decode.amount_msat,
+        description=decode.description,
+        description_hash=decode.description_hash,
     )
 
 
-@clnrest_api_router.get(
-    "/api/v1/owner_data/{owner_data_id}",
-    name="Get OwnerData",
-    summary="Get the owner_data with this id.",
-    response_description="An owner_data or 404 if not found",
-    response_model=OwnerData,
-)
-async def api_get_owner_data(
-    owner_data_id: str,
-    user: User = Depends(check_user_exists),
-) -> OwnerData:
+@clnrest_api_router.post("/disableoffer")
+async def clnrest_disableoffer(
+    enable_offer_data: EnableOfferData, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)
+):
+    logger.debug("disabling offer: " + enable_offer_data.offer_id)
 
-    owner_data = await get_owner_data(user.id, owner_data_id)
-    if not owner_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "OwnerData not found.")
+    try:
+        offer = await disable_offer(wallet_id=key_type.wallet.id, offer_id=enable_offer_data.offer_id)
+        return ListOffers(
+            offer_id=offer.offer_id,
+            active=offer.active,
+            single_use=offer.single_use,
+            bolt12=offer.bolt12,
+            used=offer.used,
+            label=offer.memo,
+        ).dict()
 
-    return owner_data
-
-
-@clnrest_api_router.delete(
-    "/api/v1/owner_data/{owner_data_id}",
-    name="Delete Owner Data",
-    summary="Delete the owner_data " "and optionally all its associated client_data.",
-    response_description="The status of the deletion.",
-    response_model=SimpleStatus,
-)
-async def api_delete_owner_data(
-    owner_data_id: str,
-    clear_client_data: bool | None = False,
-    user: User = Depends(check_user_exists),
-) -> SimpleStatus:
-
-    await delete_owner_data(user.id, owner_data_id)
-    if clear_client_data is True:
-        # await delete all client data associated with this owner data
-        pass
-    return SimpleStatus(success=True, message="Owner Data Deleted")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Offer could not be disabled: " + str(exc),
+        ) from exc
 
 
-############################# Client Data #############################
-@clnrest_api_router.post(
-    "/api/v1/client_data/{owner_data_id}",
-    name="Create Client Data",
-    summary="Create new client data for the specified owner data.",
-    response_description="The created client data.",
-    response_model=ClientData,
-    status_code=HTTPStatus.CREATED,
-)
-async def api_create_client_data(
-    owner_data_id: str,
-    data: CreateClientData,
-    user: User = Depends(check_user_exists),
-) -> ClientData:
-    owner_data = await get_owner_data(user.id, owner_data_id)
-    if not owner_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "Owner Data not found.")
+@clnrest_api_router.post("/enableoffer")
+async def clnrest_enableoffer(
+    enable_offer_data: EnableOfferData, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)
+):
+    logger.debug("enabling offer: " + enable_offer_data.offer_id)
 
-    client_data = await create_client_data(owner_data_id, data)
-    return client_data
+    try:
+        offer = await enable_offer(wallet_id=key_type.wallet.id, offer_id=enable_offer_data.offer_id)
+        return ListOffers(
+            offer_id=offer.offer_id,
+            active=offer.active,
+            single_use=offer.single_use,
+            bolt12=offer.bolt12,
+            used=offer.used,
+            label=offer.memo,
+        ).dict()
 
-
-
-
-@clnrest_api_router.put(
-    "/api/v1/client_data/{client_data_id}",
-    name="Update Client Data",
-    summary="Update the client_data with this id.",
-    response_description="The updated client data.",
-    response_model=ClientData,
-)
-async def api_update_client_data(
-    client_data_id: str,
-    data: CreateClientData,
-    user: User = Depends(check_user_exists),
-) -> ClientData:
-    client_data = await get_client_data_by_id(client_data_id)
-    if not client_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "Client Data not found.")
-
-    owner_data = await get_owner_data(user.id, client_data.owner_data_id)
-    if not owner_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "Owner Data not found.")
-
-    client_data = await update_client_data(ClientData(**{**client_data.dict(), **data.dict()}))
-    return client_data
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Offer could not be enabled: " + str(exc),
+        ) from exc
 
 
-@clnrest_api_router.get(
-    "/api/v1/client_data/paginated",
-    name="Client Data List",
-    summary="get paginated list of client_data",
-    response_description="list of client_data",
-    openapi_extra=generate_filter_params_openapi(ClientDataFilters),
-    response_model=Page[ClientData],
-)
-async def api_get_client_data_paginated(
-    user: User = Depends(check_user_exists),
-    owner_data_id: str | None = None,
-    filters: Filters = Depends(client_data_filters),
-) -> Page[ClientData]:
+@clnrest_api_router.post("/fetchinvoice")
+async def clnrest_fetchinvoice(
+    fetch_invoice_data: FetchInvoiceData, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)
+) -> FetchInvoice:
+    logger.debug("fetch invoice data: " + str(fetch_invoice_data.dict()))
 
-    owner_data_ids = await get_owner_data_ids_by_user(user.id)
+    try:
+        return FetchInvoice(
+            invoice=await fetch_invoice(
+                wallet_id=key_type.wallet.id,
+                offer=fetch_invoice_data.offer,
+                amount=ceil(fetch_invoice_data.amount_msat * 0.001),
+            )
+        )
 
-    if owner_data_id:
-        if owner_data_id not in owner_data_ids:
-            raise HTTPException(HTTPStatus.FORBIDDEN, "Not your owner data.")
-        owner_data_ids = [owner_data_id]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=str(exc),
+        )
 
-    return await get_client_data_paginated(
-        owner_data_ids=owner_data_ids,
-        filters=filters,
+
+@clnrest_api_router.post("/getinfo")
+async def clnrest_getinfo(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {
+        "id": "030000000000000000000000000000000000000000000000000000000000000000",
+        "alias": "LNbits",
+        "num_peers": 1,
+        "num_pending_channels": 0,
+        "num_active_channels": 1,
+        "num_inactive_channels": 0,
+        "address": [],
+        "version": "v0.1.2",
+        "network": "bitcoin",
+        "fees_collected_msat": 0,
+    }
+
+
+@clnrest_api_router.post("/invoice")
+async def clnrest_invoice(
+    invoice_data: InvoiceData, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)
+) -> Invoice:
+    logger.debug("invoice data: " + str(invoice_data.dict()))
+
+    if not isinstance(invoice_data.amount_msat, int):
+        if invoice_data.amount_msat != "any":
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Invalid amount_msat: " + invoice_data.amount_msat,
+            )
+        invoice_data.amount_msat = 0
+
+    invoice_data = CreateInvoice(
+        out=False,
+        amount=round(invoice_data.amount_msat * 0.001),
+        memo=invoice_data.description,
+        expiry=invoice_data.expiry,
+    )
+
+    try:
+        payment = await create_payment_request(wallet_id=key_type.wallet.id, invoice_data=invoice_data)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Invoice failed: " + str(exc),
+        )
+
+    if not payment or not payment.bolt11:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Could not create invoice",
+        )
+    return Invoice(
+        bolt11=payment.bolt11,
+        payment_hash=payment.payment_hash,
+        expires_at=int(payment.expiry.timestamp()) if payment.expiry else None,
     )
 
 
-@clnrest_api_router.get(
-    "/api/v1/client_data/{client_data_id}",
-    name="Get Client Data",
-    summary="Get the client data with this id.",
-    response_description="An client data or 404 if not found",
-    response_model=ClientData,
-)
-async def api_get_client_data(
-    client_data_id: str,
-    user: User = Depends(check_user_exists),
-) -> ClientData:
-
-    client_data = await get_client_data_by_id(client_data_id)
-    if not client_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "ClientData not found.")
-    owner_data = await get_owner_data(user.id, client_data.owner_data_id)
-    if not owner_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "Owner Data deleted for this Client Data.")
-
-    return client_data
+@clnrest_api_router.post("/listchannels")
+async def clnrest_listchannels(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {"channels": []}
 
 
-@clnrest_api_router.delete(
-    "/api/v1/client_data/{client_data_id}",
-    name="Delete Client Data",
-    summary="Delete the client_data",
-    response_description="The status of the deletion.",
-    response_model=SimpleStatus,
-)
-async def api_delete_client_data(
-    client_data_id: str,
-    user: User = Depends(check_user_exists),
-) -> SimpleStatus:
-
-    client_data = await get_client_data_by_id(client_data_id)
-    if not client_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "ClientData not found.")
-    owner_data = await get_owner_data(user.id, client_data.owner_data_id)
-    if not owner_data:
-        raise HTTPException(HTTPStatus.NOT_FOUND, "Owner Data deleted for this Client Data.")
-
-    await delete_client_data(owner_data.id, client_data_id)
-    return SimpleStatus(success=True, message="Client Data Deleted")
+@clnrest_api_router.post("/listclosedchannels")
+async def clnrest_listclosedchannels(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {"closedchannels": []}
 
 
+@clnrest_api_router.post("/listfunds")
+async def clnrest_listfunds(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {
+        "outputs": [],
+        "channels": [
+            {
+                "connected": True,
+                "state": "CHANNELD_NORMAL",
+                "amount_msat": 2100000000000000000,
+                "our_amount_msat": key_type.wallet.balance * 1000,
+            }
+        ],
+    }
+
+
+@clnrest_api_router.post("/listnodes")
+async def clnrest_listnodes(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {"nodes": []}
+
+
+@clnrest_api_router.post("/listoffers")
+async def clnrest_listoffers(
+    list_offers_data: ListOffersData, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)
+):
+    roffers = []
+
+    if list_offers_data.offer_id:
+        async with db.connect() as conn:
+            offer = await get_standalone_offer(
+                offer_id=list_offers_data.offer_id,
+                wallet_id=key_type.wallet.id,
+                active=list_offers_data.active_only,
+                conn=conn,
+            )
+
+        if offer:
+            roffers = [
+                ListOffers(
+                    offer_id=offer.offer_id,
+                    active=offer.active,
+                    single_use=offer.single_use,
+                    bolt12=offer.bolt12,
+                    used=offer.used,
+                    label=offer.memo,
+                ).dict()
+            ]
+
+    filters: Filters[OfferFilters] = Filters()
+    filters.sortby = "updated_at"
+    filters.direction = "desc"
+    async with db.connect() as conn:
+        offers = await get_offers(
+            wallet_id=key_type.wallet.id, active=list_offers_data.active_only, filters=filters, conn=conn
+        )
+
+        for o in offers:
+            roffers.append(
+                ListOffers(
+                    offer_id=o.offer_id,
+                    active=o.active,
+                    single_use=o.single_use,
+                    bolt12=o.bolt12,
+                    used=o.used,
+                    label=o.memo,
+                ).dict()
+            )
+    logger.debug(roffers)
+    return {"offers": roffers}
+
+
+@clnrest_api_router.post("/listpeerchannels")
+async def clnrest_listpeerchannels(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {
+        "channels": [
+            {
+                "peer_id": "030000000000000000000000000000000000000000000000000000000000000000",
+                "peer_connected": True,
+                "state": "CHANNELD_NORMAL",
+                "short_channel_id": "123456x1x0",
+                "channel_id": "4000000000000000000000000000000000000000000000000000000000000000",
+                "funding_txid": "4000000000000000000000000000000000000000000000000000000000000000",
+                "funding_outnum": 0,
+                "close_to_addr": "bc100000000000000000000000000000000000000000000000000000000000",
+                "private": True,
+                "to_us_msat": key_type.wallet.balance * 1000,
+                "min_to_us_msat": key_type.wallet.balance * 1000,
+                "max_to_us_msat": 2100000000000000000,
+                "total_msat": 2100000000000000000,
+                "their_reserve_msat": 0,
+                "our_reserve_msat": 0,
+                "our_to_self_delay": 600,
+                "in_payments_offered": 0,
+                "in_fulfilled_msat": 0,
+                "out_payments_offered": 0,
+                "out_payments_fulfilled": 0,
+                "out_fulfilled_msat": 0,
+            }
+        ]
+    }
+
+
+@clnrest_api_router.post("/listpeers")
+async def clnrest_listpeers(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {"peers": []}
+
+
+@clnrest_api_router.post("/listtransactions")
+async def clnrest_listtransactions(key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    return {"transactions": []}
+
+
+@clnrest_api_router.post("/offer")
+async def clnrest_offer(
+    offer_data: OfferData, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)
+) -> Offer:
+    logger.debug("offer data: " + str(offer_data.dict()))
+
+    try:
+
+        if isinstance(offer_data.amount, str):
+            if offer_data.amount != "any":
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail=f"Offer amount '{offer_data.amount}' is invalid",
+                )
+            amount_msat = None
+
+        else:
+            amount_msat = offer_data.amount
+        return await create_offer(
+            wallet_id=key_type.wallet.id,
+            memo=offer_data.description,
+            amount_sat=(int(amount_msat / 1000) if amount_msat else None),
+            single_use=offer_data.single_use,
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=str(exc),
+        )
+
+
+@clnrest_api_router.post("/pay")
+async def clnrest_pay(pay_data: PayData, key_type: WalletTypeInfo = Depends(clnrest_require_admin_key)) -> Pay:
+    logger.debug("pay data: " + str(pay_data.dict()))
+
+    if pay_data.amount_msat:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="LNbits does not support paying over the invoiced amount",
+        )
+
+    try:
+        payment = await pay_invoice(
+            wallet_id=key_type.wallet.id,
+            payment_request=pay_data.bolt11,
+            max_sat=ceil(pay_data.amount_msat * 0.001) if pay_data.amount_msat else None,
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Payment failed: " + str(exc),
+        )
+
+    return Pay(
+        payment_preimage=payment.preimage,
+        payment_hash=payment.payment_hash,
+        created_at=int(payment.created_at.timestamp()),
+        parts=1,
+        amount_msat=payment.amount,
+        amount_sent_msat=payment.amount + payment.fee,
+        status="complete" if payment.status == PaymentState.SUCCESS else payment.status,
+    )
+
+
+@clnrest_api_router.post("/sql")
+async def clnrest_sql(query: QueryStr, key_type: WalletTypeInfo = Depends(clnrest_require_invoice_key)):
+    logger.debug("query: " + query.query)
+    filters: Filters[PaymentFilters] = Filters()
+
+    if (
+        query.query
+        == "select sp.payment_hash, sp.groupid, min(sp.status) as status, min(sp.destination) as destination, min(sp.created_at) as created_at, min(sp.description) as description, min(sp.bolt11) as bolt11, min(sp.bolt12) as bolt12, sum(case when sp.status = 'complete' then sp.amount_sent_msat else null end) as amount_sent_msat, sum(case when sp.status = 'complete' then sp.amount_msat else 0 end) as amount_msat, max(sp.payment_preimage) as preimage from sendpays sp group by sp.payment_hash, sp.groupid order by created_index desc limit 150"
+    ):
+        filters.sortby = "updated_at"
+        filters.direction = "desc"
+        async with db.connect() as conn:
+            payments = await get_payments(
+                wallet_id=key_type.wallet.id, outgoing=True, filters=filters, limit=150, conn=conn
+            )
+        rpmts = []
+
+        for p in payments:
+            invoice_obj = bolt11_decode(p.bolt11)
+            rpmts.append(
+                [
+                    p.payment_hash,
+                    1,
+                    "complete" if p.status == PaymentState.SUCCESS else p.status,
+                    invoice_obj.payee,
+                    int(p.created_at.timestamp()),
+                    p.memo,
+                    p.bolt11,
+                    p.offer_id,
+                    -p.amount-p.fee if p.status == PaymentState.SUCCESS else None,
+                    -p.amount if p.status == PaymentState.SUCCESS else 0,
+                    p.preimage,
+                ]
+            )
+        logger.debug(rpmts)
+        return {"rows": rpmts}
+
+    else:
+        qcmp = "SELECT label, bolt11, bolt12, payment_hash, amount_msat, status, amount_received_msat, paid_at, payment_preimage, description, expires_at FROM invoices WHERE status = 'paid' ORDER BY created_index DESC LIMIT "
+        qcmplen = len(qcmp)
+        if query.query > qcmp:
+            try:
+                nlines = int(query.query[qcmplen:-1])
+            except Exception:
+                nlines = -1
+
+            if nlines <= 0:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="Invalid number of requested lines: " + query.query[qcmplen:-1],
+                )
+
+            filters.sortby = "updated_at"
+            filters.direction = "desc"
+            async with db.connect() as conn:
+                payments = await get_payments(
+                    wallet_id=key_type.wallet.id, complete=True, incoming=True, filters=filters, limit=nlines, conn=conn
+                )
+            rpmts = []
+
+            for p in payments:
+                rpmts.append(
+                    [
+                        "",
+                        p.bolt11,
+                        p.offer_id,
+                        p.payment_hash,
+                        p.amount,
+                        "paid" if p.status == PaymentState.SUCCESS else p.status,
+                        p.amount if p.status == PaymentState.SUCCESS else 0,
+                        int(p.updated_at.timestamp()),
+                        p.preimage,
+                        p.memo,
+                        int(p.expiry.timestamp()) if p.expiry else None,
+                    ]
+                )
+            logger.debug(rpmts)
+            return {"rows": rpmts}
+
+    return {"rows": []}

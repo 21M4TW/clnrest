@@ -1,6 +1,6 @@
 {
-  "name": "lnurlp",
-  "version": "1.0.0",
+  "name": "clnrest",
+  "version": "0.1.2",
   "description": "",
   "main": "index.js",
   "scripts": {
