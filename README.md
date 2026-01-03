@@ -12,4 +12,5 @@ It does not strictly require an underlying CoreLightning backend (but Bolt12 sup
 You add and enable the LNDhub extension on your left panel through the "Extensions" menue and scan the QR code that fits your needs.
 With the "Invoice QR" you can give access to generating invoices and (only) receive sats into your wallet (e.g. useful for your waiters if you own a cafe).
 With the "Admin QR" you also grant access sending / withdrawing from that wallet.
-A reverse proxy can be used to remap the CLN REST URL, if needed.
+
+This extension is available from [this LNbits extension repository](https://raw.githubusercontent.com/21M4TW/lnbits-extensions/main/extensions.json)
